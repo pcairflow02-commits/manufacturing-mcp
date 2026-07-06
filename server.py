@@ -15,9 +15,29 @@ Run:
 
 import os
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 import data_access as db
 
-mcp = FastMCP("Manufacturing MCP")
+# Your public domain(s) must be listed here, or the MCP library's
+# DNS-rebinding protection will reject requests with "Invalid Host header" /
+# "421 Misdirected Request", even with a correct API key.
+# Set MCP_ALLOWED_HOST env var to your Render domain, e.g.:
+#   manufacturing-mcp.onrender.com
+_allowed_host = os.environ.get("MCP_ALLOWED_HOST", "")
+_allowed_hosts = ["127.0.0.1", "localhost"]
+_allowed_origins = ["http://127.0.0.1*", "http://localhost*"]
+if _allowed_host:
+    _allowed_hosts.append(_allowed_host)
+    _allowed_origins.append(f"https://{_allowed_host}")
+
+mcp = FastMCP(
+    "Manufacturing MCP",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+        allowed_origins=_allowed_origins,
+    ),
+)
 
 
 # ---------------------------------------------------------------------
