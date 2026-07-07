@@ -151,6 +151,18 @@ def get_vehicle_by_dispatch(dispatch_id: str) -> dict:
 if __name__ == "__main__":
     if _transport == "http":
         port = int(os.environ.get("PORT", 8000))
-        mcp.run(transport="http", host="0.0.0.0", port=port)
+        # Your public domain(s) must be listed here, or fastmcp's built-in
+        # DNS-rebinding protection will reject requests with "421 Misdirected
+        # Request" / "Invalid Host header", even with valid OAuth.
+        # BASE_URL already carries this, so we derive it automatically.
+        from urllib.parse import urlparse
+        _base_host = urlparse(os.environ["BASE_URL"]).netloc
+        mcp.run(
+            transport="http",
+            host="0.0.0.0",
+            port=port,
+            allowed_hosts=[_base_host, "127.0.0.1", "localhost"],
+            allowed_origins=[f"https://{_base_host}", "http://127.0.0.1*", "http://localhost*"],
+        )
     else:
         mcp.run(transport="stdio")
