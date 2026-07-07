@@ -8,36 +8,42 @@ Currently backed by mock data (see mock_data.py / data_access.py).
 Swap data_access.py for real ERP/MES queries later — this file won't
 need to change.
 
+AUTH:
+- Local mode (stdio, for Claude Desktop's old `command` config): no auth,
+  not needed since it never leaves your machine.
+- Remote mode (MCP_TRANSPORT=http): protected by WorkOS AuthKit OAuth.
+  Every user must log in with an invited email before they can use any tool.
+
+Required environment variables for remote/http mode:
+    MCP_TRANSPORT=http
+    AUTHKIT_DOMAIN=https://your-project-xxxx.authkit.app   (from WorkOS)
+    BASE_URL=https://your-server.onrender.com               (your Render URL, no trailing slash)
+
 Run:
-    uv run server.py                # stdio transport (for Claude Desktop)
-    uv run mcp dev server.py        # test with MCP Inspector
+    python3 server.py                       # stdio transport (local, for Claude Desktop)
+    MCP_TRANSPORT=http python3 server.py    # http transport (remote, WorkOS-authenticated)
 """
 
 import os
-from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
+from fastmcp import FastMCP
 import data_access as db
 
-# Your public domain(s) must be listed here, or the MCP library's
-# DNS-rebinding protection will reject requests with "Invalid Host header" /
-# "421 Misdirected Request", even with a correct API key.
-# Set MCP_ALLOWED_HOST env var to your Render domain, e.g.:
-#   manufacturing-mcp.onrender.com
-_allowed_host = os.environ.get("MCP_ALLOWED_HOST", "")
-_allowed_hosts = ["127.0.0.1", "localhost"]
-_allowed_origins = ["http://127.0.0.1*", "http://localhost*"]
-if _allowed_host:
-    _allowed_hosts.append(_allowed_host)
-    _allowed_origins.append(f"https://{_allowed_host}")
+_transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
 
-mcp = FastMCP(
-    "Manufacturing MCP",
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=_allowed_hosts,
-        allowed_origins=_allowed_origins,
-    ),
-)
+if _transport == "http":
+    from fastmcp.server.auth.providers.workos import AuthKitProvider
+
+    authkit_domain = os.environ["AUTHKIT_DOMAIN"]   # e.g. https://xxxx.authkit.app
+    base_url = os.environ["BASE_URL"]               # e.g. https://manufacturing-mcp.onrender.com
+
+    auth_provider = AuthKitProvider(
+        authkit_domain=authkit_domain,
+        base_url=base_url,
+    )
+    mcp = FastMCP(name="Manufacturing MCP", auth=auth_provider)
+else:
+    # Local stdio mode — no auth needed, never leaves this machine.
+    mcp = FastMCP(name="Manufacturing MCP")
 
 
 # ---------------------------------------------------------------------
@@ -142,52 +148,9 @@ def get_vehicle_by_dispatch(dispatch_id: str) -> dict:
     return result if result else {"error": f"No vehicle found for dispatch {dispatch_id}"}
 
 
-# ---------------------------------------------------------------------
-# API KEY AUTH (for remote/HTTP mode only — not used for local stdio)
-# ---------------------------------------------------------------------
-# Set MCP_API_KEY as an environment variable on your host (never hardcode
-# it here). Every request must send: Authorization: Bearer <key>
-def build_authenticated_app():
-    from starlette.applications import Starlette
-    from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse
-
-    api_key = os.environ.get("MCP_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "MCP_API_KEY environment variable is not set. "
-            "Set it before running in HTTP mode."
-        )
-
-    class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            auth_header = request.headers.get("authorization", "")
-            expected = f"Bearer {api_key}"
-            if auth_header != expected:
-                return JSONResponse(
-                    {"error": "Unauthorized"}, status_code=401
-                )
-            return await call_next(request)
-
-    inner_app = mcp.streamable_http_app()
-    inner_app.add_middleware(ApiKeyAuthMiddleware)
-    return inner_app
-
-
-# This module-level `app` is what uvicorn will serve in HTTP mode.
-# (Only built when run via uvicorn, e.g. `uvicorn server:app`.)
-app = None
-if os.environ.get("MCP_TRANSPORT", "").lower() == "http":
-    app = build_authenticated_app()
-
-
 if __name__ == "__main__":
-    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
-    if transport == "http":
-        import uvicorn
+    if _transport == "http":
         port = int(os.environ.get("PORT", 8000))
-        uvicorn.run(build_authenticated_app(), host="0.0.0.0", port=port)
+        mcp.run(transport="http", host="0.0.0.0", port=port)
     else:
-        # Local mode for Claude Desktop (unauthenticated, stdio transport)
         mcp.run(transport="stdio")
