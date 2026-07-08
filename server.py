@@ -46,106 +46,163 @@ else:
     mcp = FastMCP(name="Manufacturing MCP")
 
 
+def _not_connected(topic: str) -> dict:
+    """
+    Standard response for tools whose data source isn't wired up yet.
+    Used instead of returning old placeholder/mock data, so it's always
+    clear to whoever's testing which tools are backed by real data right
+    now and which aren't.
+    """
+    return {
+        "error": (
+            f"{topic} information is not in the current data sheet yet. "
+            "Only production order data (get_orders, get_order_by_id, "
+            "get_order_summary) is connected to real data right now."
+        )
+    }
+
+
 # ---------------------------------------------------------------------
 # MACHINE STATUS
 # ---------------------------------------------------------------------
 @mcp.tool()
-def get_machine_status(machine_id: str = "", line_id: str = "") -> list[dict]:
+def get_machine_status(machine_id: str = "", line_id: str = "") -> list[dict] | dict:
     """
     Get status of shop-floor machines (running / idle / down), including
     uptime today and maintenance dates. Optionally filter by machine_id
     (e.g. 'M-101') or line_id (e.g. 'LINE-A'). Leave blank to get all machines.
+    NOTE: not yet connected to real data — currently returns a not-available message.
     """
-    return db.get_machine_status(machine_id or None, line_id or None)
+    return _not_connected("Machine status")
 
 
 # ---------------------------------------------------------------------
 # WORK ORDERS
 # ---------------------------------------------------------------------
 @mcp.tool()
-def get_work_orders(status: str = "", line_id: str = "") -> list[dict]:
+def get_work_orders(status: str = "", line_id: str = "") -> list[dict] | dict:
     """
-    List work orders. Optionally filter by status ('open', 'in_progress',
-    'completed') and/or line_id (e.g. 'LINE-A'). Leave blank to get all.
+    List work orders (old schema: line_id, open/in_progress/completed).
+    NOTE: not yet connected to real data. For real order tracking, use
+    get_orders / get_order_by_id / get_order_summary instead.
     """
-    return db.get_work_orders(status or None, line_id or None)
+    return _not_connected("Work order (old schema)")
 
 
 @mcp.tool()
 def get_work_order_by_id(order_id: str) -> dict:
-    """Get full details of a single work order by its ID (e.g. 'WO-5001')."""
-    result = db.get_work_order_by_id(order_id)
-    return result if result else {"error": f"No work order found with ID {order_id}"}
+    """
+    Get a single work order by ID (old schema, e.g. 'WO-5001').
+    NOTE: not yet connected to real data. For real orders, use get_order_by_id instead.
+    """
+    return _not_connected("Work order (old schema)")
 
 
 # ---------------------------------------------------------------------
 # INVENTORY
 # ---------------------------------------------------------------------
 @mcp.tool()
-def get_inventory(sku: str = "", below_reorder_only: bool = False) -> list[dict]:
+def get_inventory(sku: str = "", below_reorder_only: bool = False) -> list[dict] | dict:
     """
     Check inventory levels for raw materials and finished goods.
-    Optionally filter by sku (e.g. 'RAW-STL-01'), or set
-    below_reorder_only=True to see only items that need reordering.
+    NOTE: not yet connected to real data — currently returns a not-available message.
     """
-    return db.get_inventory(sku or None, below_reorder_only)
+    return _not_connected("Inventory")
 
 
 # ---------------------------------------------------------------------
 # QUALITY LOGS
 # ---------------------------------------------------------------------
 @mcp.tool()
-def get_quality_logs(product_id: str = "", min_defect_rate_pct: float = -1) -> list[dict]:
+def get_quality_logs(product_id: str = "", min_defect_rate_pct: float = -1) -> list[dict] | dict:
     """
     Get quality inspection logs, including defect rates and inspector notes.
-    Optionally filter by product_id (partial match, e.g. 'Housing') or
-    min_defect_rate_pct to find batches at or above a defect threshold.
+    NOTE: not yet connected to real data — currently returns a not-available message.
+    (QC_Remarks does exist per-order in get_orders/get_order_by_id, but there's
+    no separate structured quality log sheet yet.)
     """
-    return db.get_quality_logs(
-        product_id or None,
-        min_defect_rate_pct if min_defect_rate_pct >= 0 else None,
-    )
+    return _not_connected("Quality log")
 
 
 # ---------------------------------------------------------------------
 # DISPATCH / ON-TIME DELIVERY
 # ---------------------------------------------------------------------
 @mcp.tool()
-def get_dispatches(status: str = "", order_id: str = "") -> list[dict]:
+def get_dispatches(status: str = "", order_id: str = "") -> list[dict] | dict:
     """
-    List dispatch records (shipments to customers). Optionally filter by
-    status ('on_time', 'late', 'pending') or order_id. Leave blank for all.
+    List dispatch records (old schema: on_time/late/pending shipments).
+    NOTE: not yet connected to real data. get_orders/get_order_by_id do
+    include Dispatch_Date and Qty_Dispatched per order, which may cover
+    what you need already.
     """
-    return db.get_dispatches(status or None, order_id or None)
+    return _not_connected("Dispatch record (old schema)")
 
 
 @mcp.tool()
 def get_on_time_dispatch_rate() -> dict:
     """
-    Get the overall on-time dispatch rate: percentage of completed
-    dispatches that went out on schedule, with counts of on-time vs late.
+    Get the overall on-time dispatch rate.
+    NOTE: not yet connected to real data — currently returns a not-available message.
     """
-    return db.get_on_time_dispatch_rate()
+    return _not_connected("On-time dispatch rate")
 
 
 # ---------------------------------------------------------------------
 # VEHICLE TRACKING
 # ---------------------------------------------------------------------
 @mcp.tool()
-def get_vehicle_status(vehicle_id: str = "") -> list[dict]:
+def get_vehicle_status(vehicle_id: str = "") -> list[dict] | dict:
     """
-    Track delivery vehicles: current location, destination, ETA, and status
-    (in_transit / delivered). Optionally filter by vehicle_id (e.g. 'VH-03').
-    Leave blank to get all vehicles.
+    Track delivery vehicles: current location, destination, ETA, and status.
+    NOTE: not yet connected to real data — currently returns a not-available message.
     """
-    return db.get_vehicle_status(vehicle_id or None)
+    return _not_connected("Vehicle tracking")
 
 
 @mcp.tool()
 def get_vehicle_by_dispatch(dispatch_id: str) -> dict:
-    """Find which vehicle is carrying a given dispatch (e.g. 'DSP-7003')."""
-    result = db.get_vehicle_by_dispatch(dispatch_id)
-    return result if result else {"error": f"No vehicle found for dispatch {dispatch_id}"}
+    """
+    Find which vehicle is carrying a given dispatch.
+    NOTE: not yet connected to real data — currently returns a not-available message.
+    """
+    return _not_connected("Vehicle tracking")
+
+
+# ---------------------------------------------------------------------
+# REAL PRODUCTION ORDERS (from production_data.xlsx, sheet "Master_Data")
+# ---------------------------------------------------------------------
+@mcp.tool()
+def get_orders(order_id: str = "", client: str = "", status: str = "", priority: int = -1, month: str = "") -> list[dict]:
+    """
+    List real production orders from the master tracking sheet. Optionally
+    filter by order_id (e.g. 'ORD-0001'), client (partial match), status
+    ('AWAITING MATERIAL', 'IN-PRODUCTION', 'READY - PENDING DISPATCH'),
+    priority (0-4), or month (e.g. 'June-2026'). Leave blank/omit to get all.
+    """
+    return db.get_orders(
+        order_id or None,
+        client or None,
+        status or None,
+        priority if priority >= 0 else None,
+        month or None,
+    )
+
+
+@mcp.tool()
+def get_order_by_id(order_id: str) -> dict:
+    """Get full details of a single real production order by its ID (e.g. 'ORD-0001')."""
+    result = db.get_order_by_id(order_id)
+    return result if result else {"error": f"No order found with ID {order_id}"}
+
+
+@mcp.tool()
+def get_order_summary() -> dict:
+    """
+    Get an overview of all real production orders: counts by status
+    (awaiting material / in-production / ready for dispatch), total
+    quantity ordered vs dispatched, and average pending/turnaround days.
+    """
+    return db.get_order_summary()
 
 
 if __name__ == "__main__":
