@@ -39,9 +39,9 @@ import urllib.error
 # ---------------------------------------------------------------------
 # CONNECTION / LOW-LEVEL HELPERS
 # ---------------------------------------------------------------------
-FRAPPE_URL = os.environ.get("FRAPPE_URL", " ").rstrip("/")
-FRAPPE_API_KEY = os.environ.get("FRAPPE_API_KEY", " ")
-FRAPPE_API_SECRET = os.environ.get("FRAPPE_API_SECRET", " ")
+FRAPPE_URL = os.environ.get("FRAPPE_URL", "").rstrip("/")
+FRAPPE_API_KEY = os.environ.get("FRAPPE_API_KEY", "")
+FRAPPE_API_SECRET = os.environ.get("FRAPPE_API_SECRET", "")
 
 # Keep page size modest — very large page sizes can mis-paginate in Frappe.
 _PAGE_SIZE = 200
