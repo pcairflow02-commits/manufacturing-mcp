@@ -317,111 +317,100 @@ def get_vehicle_by_dispatch(dispatch_id: str):
 
 
 # =====================================================================
-# REAL PRODUCTION ORDERS
+# REAL PRODUCTION / SALES ORDERS  ->  ERPNext "Sales Order"
 # ---------------------------------------------------------------------
-# These 3 functions currently sync from your published Google Sheet (working).
-# They are left UNCHANGED so nothing you already rely on breaks.
+# The spreadsheet/CSV source is gone. This now reads live from your
+# Frappe/ERPNext site's Sales Order doctype via the same _frappe_list /
+# _frappe_get helpers used everywhere else in this file.
 #
-# If your production tracker actually lives inside Frappe (a custom DocType or
-# Sales Orders), you can instead point these at Frappe using _frappe_list /
-# _frappe_get above — but only do that if the sheet is going away.
+# Field names below (customer, transaction_date, delivery_date, total_qty,
+# per_delivered, grand_total, status) are STANDARD ERPNext Sales Order
+# fields. If your site customised Sales Order, fetch one record to check:
+#   curl -H "Authorization: token KEY:SECRET" \
+#        "$FRAPPE_URL/api/resource/Sales Order/SO-2026-00001"
+#
+# NOTE: "Priority" has no standard equivalent on Sales Order. If you added
+# a custom field for it, add its fieldname to `_SO_FIELDS` and filter on
+# it in get_orders(); until then the `priority` argument is accepted but
+# ignored (matches everything, never errors).
 # =====================================================================
-import csv
-import io
 import datetime
+import calendar
 
-_CSV_URL = os.environ.get("PRODUCTION_SHEET_CSV_URL", "").strip()
-_LOCAL_XLSX_FALLBACK = os.path.join(os.path.dirname(__file__), "production_data.xlsx")
-
-_NUMERIC_COLUMNS = {
-    "Priority", "ERP_Sales_Order", "Job_No", "Qty_Ordered", "Qty_Ready",
-    "Qty_Dispatched", "Balance", "Amount", "Score", "Pending_Days",
-    "Turnaround_Days",
-}
+_SO_FIELDS = [
+    "name", "customer", "status", "transaction_date", "delivery_date",
+    "grand_total", "total_qty", "per_delivered", "per_billed",
+]
 
 
-def _coerce_value(header: str, raw: str):
-    if raw is None:
+def _month_str(date_str):
+    """'2026-07-15' -> 'July-2026' (matches the old Month column format)."""
+    if not date_str:
         return None
-    value = raw.strip()
-    if value == "":
+    try:
+        y, m, _d = str(date_str).split("-")
+        return f"{calendar.month_name[int(m)]}-{y}"
+    except (ValueError, IndexError):
         return None
-    if header in _NUMERIC_COLUMNS:
+
+
+def _map_sales_order(r: dict) -> dict:
+    total_qty = r.get("total_qty") or 0
+    per_delivered = r.get("per_delivered") or 0
+    qty_dispatched = round(total_qty * per_delivered / 100, 2) if total_qty else 0
+
+    pending_days = None
+    delivery_date = r.get("delivery_date")
+    if delivery_date and r.get("status") not in ("Completed", "Closed", "Cancelled"):
         try:
-            return float(value) if "." in value else int(value)
+            dd = datetime.date.fromisoformat(str(delivery_date))
+            pending_days = (dd - datetime.date.today()).days
         except ValueError:
-            return value
-    if value.endswith(" 00:00:00") and len(value) == 19:
-        value = value[:10]
-    return value
+            pass
 
-
-def _load_from_csv_url(url: str):
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        raw = resp.read().decode("utf-8-sig")
-    reader = csv.reader(io.StringIO(raw))
-    rows = list(reader)
-    if not rows:
-        return []
-    headers = rows[0]
-    orders = []
-    for row in rows[1:]:
-        if all(cell.strip() == "" for cell in row):
-            continue
-        orders.append({h: _coerce_value(h, v) for h, v in zip(headers, row)})
-    return orders
-
-
-def _load_from_local_xlsx():
-    from openpyxl import load_workbook
-    wb = load_workbook(_LOCAL_XLSX_FALLBACK, data_only=True)
-    ws = wb["Master_Data"]
-    headers = [c.value for c in ws[1]]
-    orders = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if all(c is None for c in row):
-            continue
-        record = {}
-        for header, value in zip(headers, row):
-            if isinstance(value, (datetime.datetime, datetime.date)):
-                value = value.date().isoformat() if isinstance(value, datetime.datetime) else value.isoformat()
-            elif isinstance(value, str) and value.strip() == "":
-                value = None
-            record[header] = value
-        orders.append(record)
-    return orders
-
-
-def _load_production_orders():
-    if _CSV_URL:
-        return _load_from_csv_url(_CSV_URL)
-    return _load_from_local_xlsx()
+    return {
+        "Order_ID": r.get("name"),
+        "Client": r.get("customer"),
+        "Row_Status": r.get("status"),
+        "Order_Date": r.get("transaction_date"),
+        "Delivery_Date": delivery_date,
+        "Month": _month_str(r.get("transaction_date")),
+        "Amount": r.get("grand_total"),
+        "Qty_Ordered": total_qty,
+        "Qty_Dispatched": qty_dispatched,
+        "Pending_Days": pending_days,
+    }
 
 
 def get_orders(order_id=None, client=None, status=None, priority=None, month=None):
-    results = _load_production_orders()
+    filters = []
     if order_id:
-        results = [o for o in results if str(o.get("Order_ID", "")).lower() == order_id.lower()]
+        filters.append(["name", "=", order_id])
     if client:
-        results = [o for o in results if o.get("Client") and client.lower() in o["Client"].lower()]
+        filters.append(["customer", "like", f"%{client}%"])
     if status:
-        results = [o for o in results if o.get("Row_Status") and o["Row_Status"].lower() == status.lower()]
-    if priority is not None:
-        results = [o for o in results if o.get("Priority") == priority]
+        filters.append(["status", "=", status])
+    # month filtering happens after fetch, since Frappe filters can't do
+    # "contains substring of formatted month name" directly.
+
+    rows = _frappe_list("Sales Order", fields=_SO_FIELDS, filters=filters or None,
+                         order_by="transaction_date desc")
+    orders = [_map_sales_order(r) for r in rows]
+
     if month:
-        results = [o for o in results if o.get("Month") and month.lower() in o["Month"].lower()]
-    return results
+        orders = [o for o in orders if o.get("Month") and month.lower() in o["Month"].lower()]
+    # priority: no native field yet — see note above.
+
+    return orders
 
 
 def get_order_by_id(order_id: str):
-    for o in _load_production_orders():
-        if str(o.get("Order_ID", "")).lower() == order_id.lower():
-            return o
-    return None
+    r = _frappe_get("Sales Order", order_id)
+    return _map_sales_order(r) if r else None
 
 
 def get_order_summary():
-    orders = _load_production_orders()
+    orders = get_orders()
     total = len(orders)
     by_status: dict[str, int] = {}
     for o in orders:
@@ -442,5 +431,5 @@ def get_order_summary():
         "total_qty_ordered": total_qty_ordered,
         "total_qty_dispatched": total_qty_dispatched,
         "avg_pending_days": _avg("Pending_Days"),
-        "avg_turnaround_days": _avg("Turnaround_Days"),
+        "avg_turnaround_days": None,  # no equivalent on Sales Order; add a custom field if you need it
     }
