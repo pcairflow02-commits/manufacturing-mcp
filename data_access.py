@@ -41,7 +41,7 @@ import urllib.error
 # ---------------------------------------------------------------------
 FRAPPE_URL = os.environ.get("FRAPPE_URL", "https://airflow-staging.frappe.cloud/app/home").rstrip("/")
 FRAPPE_API_KEY = os.environ.get("FRAPPE_API_KEY", "467c5e731c14c33")
-FRAPPE_API_SECRET = os.environ.get("FRAPPE_API_SECRET", "467c5e731c14c33:0d013db13b522cc2")
+FRAPPE_API_SECRET = os.environ.get("FRAPPE_API_SECRET", "467c5e731c14c33:0d013db13b52cc2")
 
 # Keep page size modest — very large page sizes can mis-paginate in Frappe.
 _PAGE_SIZE = 200
