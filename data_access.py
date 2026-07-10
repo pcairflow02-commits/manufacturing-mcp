@@ -1,435 +1,218 @@
 """
-Data access layer — Frappe / ERPNext edition.
+Data access layer — multi-sheet edition.
 
-Every tool in server.py calls a function in this file. Each function talks to
-your Frappe/ERPNext site over its REST API and returns plain Python (a list of
-dicts, or a single dict) shaped the way server.py already expects. Because the
-function names, arguments, and return shapes are unchanged, server.py does not
-need to change (except un-stubbing the 8 tools — see the notes I gave you).
-
-------------------------------------------------------------------------------
-REQUIRED ENVIRONMENT VARIABLES  (set these in Render -> your service -> Environment)
-------------------------------------------------------------------------------
-    FRAPPE_URL          e.g. https://erp.yourcompany.com   (NO trailing slash)
-    FRAPPE_API_KEY      the API key of a READ-ONLY Frappe user
-    FRAPPE_API_SECRET   that user's API secret
+This server can expose ANY number of Google Sheets (or local CSV/XLSX files),
+one per environment variable. Each variable holds that sheet's *published CSV*
+link (in Google Sheets: File -> Share -> Publish to web -> CSV). Nothing here
+is hardcoded to a particular sheet — add a new sheet later by adding a new env
+var with a CSV link and it shows up automatically, no code change.
 
 ------------------------------------------------------------------------------
-IMPORTANT — DocType and field names
+HOW SHEETS ARE DISCOVERED
 ------------------------------------------------------------------------------
-The DocType names ("Work Order", "Bin", "Delivery Note", ...) and the field
-lists below are the STANDARD ERPNext ones. If your site is customised, the
-field names may differ. To see the exact fields on any DocType, fetch one full
-record, e.g.:
+By default, every environment variable whose value looks like a published-CSV
+link (contains "output=csv") is treated as a sheet, and the variable NAME
+becomes the sheet's name. So with these Render vars:
 
-    curl -H "Authorization: token KEY:SECRET" \
-         "https://erp.yourcompany.com/api/resource/Work Order/WO-2026-00001"
+    FMS_SHEET     = https://docs.google.com/.../pub?...output=csv
+    Master_Data   = https://docs.google.com/.../pub?...output=csv
+    SO_PRODUCTION = https://docs.google.com/.../pub?...output=csv
 
-Then adjust the `fields=[...]` and filter names below to match. Keep each
-function's name, arguments, and return shape the same.
+...the server exposes three sheets: FMS_SHEET, Master_Data, SO_PRODUCTION.
+Config vars (AUTHKIT_DOMAIN, BASE_URL, MCP_TRANSPORT, MCP_API_KEY) are ignored
+automatically because they aren't CSV links.
+
+To add more sheets in future: just add another env var whose value is a
+published CSV link. Done.
+
+To control the list explicitly instead of auto-discovering, set:
+    SHEETS = FMS_SHEET,Master_Data,SO_PRODUCTION
+Each named var must then hold that sheet's CSV link (or, for local dev, a path
+to a .csv / .xlsx file).
 """
 
 import os
-import json
-import urllib.parse
+import io
+import csv
+import time
 import urllib.request
 import urllib.error
 
 
+_CSV_MARKER = "output=csv"
+_CACHE_TTL = 30          # seconds; sheets are re-fetched at most this often
+_cache: dict[str, tuple[float, list]] = {}   # source -> (timestamp, rows)
+
+
 # ---------------------------------------------------------------------
-# CONNECTION / LOW-LEVEL HELPERS
+# SHEET REGISTRY
 # ---------------------------------------------------------------------
-FRAPPE_URL = os.environ.get("FRAPPE_URL", "").rstrip("/")
-FRAPPE_API_KEY = os.environ.get("FRAPPE_API_KEY", "")
-FRAPPE_API_SECRET = os.environ.get("FRAPPE_API_SECRET", "")
+def _discover_sheets() -> dict[str, str]:
+    """Return {sheet_name: source_url_or_path}."""
+    explicit = os.environ.get("SHEETS", "").strip()
+    if explicit:
+        names = [n.strip() for n in explicit.split(",") if n.strip()]
+        return {n: os.environ.get(n, "").strip()
+                for n in names if os.environ.get(n, "").strip()}
 
-# Keep page size modest — very large page sizes can mis-paginate in Frappe.
-_PAGE_SIZE = 200
-
-
-def _auth_header() -> str:
-    if not (FRAPPE_API_KEY and FRAPPE_API_SECRET):
-        raise RuntimeError(
-            "FRAPPE_API_KEY / FRAPPE_API_SECRET are not set. Add them as "
-            "environment variables (see the top of this file)."
-        )
-    return f"token {FRAPPE_API_KEY}:{FRAPPE_API_SECRET}"
-
-
-def _request(path: str):
-    if not FRAPPE_URL:
-        raise RuntimeError("FRAPPE_URL is not set.")
-    req = urllib.request.Request(
-        f"{FRAPPE_URL}{path}",
-        headers={"Authorization": _auth_header(), "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    out: dict[str, str] = {}
+    for name, val in os.environ.items():
+        v = (val or "").strip()
+        if not v:
+            continue
+        if _CSV_MARKER in v or v.lower().endswith((".csv", ".xlsx")):
+            out[name] = v
+    return out
 
 
-def _frappe_list(doctype: str, fields=None, filters=None, order_by=None):
-    """
-    Fetch ALL records of a DocType, auto-paginating. Returns a list of dicts.
-    `filters` is a list like [["status", "=", "Completed"], ["qty", ">", 0]].
-    """
-    all_rows = []
-    start = 0
-    params = {"limit_page_length": _PAGE_SIZE}
-    if fields:
-        params["fields"] = json.dumps(fields)
-    if filters:
-        params["filters"] = json.dumps(filters)
-    if order_by:
-        params["order_by"] = order_by
-    dt = urllib.parse.quote(doctype)
-    while True:
-        params["limit_start"] = start
-        qs = urllib.parse.urlencode(params)
-        data = _request(f"/api/resource/{dt}?{qs}").get("data", [])
-        all_rows.extend(data)
-        if len(data) < _PAGE_SIZE:
-            break
-        start += _PAGE_SIZE
-    return all_rows
+def _resolve(sheet: str) -> str:
+    sheets = _discover_sheets()
+    if sheet not in sheets:
+        raise KeyError(sheet)
+    return sheets[sheet]
 
 
-def _frappe_get(doctype: str, name: str):
-    """Fetch a single document (all fields) as a dict, or None if not found."""
+def list_sheet_names() -> list[str]:
+    return sorted(_discover_sheets().keys())
+
+
+# ---------------------------------------------------------------------
+# LOADING (cached)
+# ---------------------------------------------------------------------
+def _load(source: str) -> list[dict]:
+    now = time.time()
+    hit = _cache.get(source)
+    if hit and (now - hit[0]) < _CACHE_TTL:
+        return hit[1]
+
+    if source.startswith(("http://", "https://")):
+        rows = _load_csv_url(source)
+    elif source.lower().endswith(".xlsx"):
+        rows = _load_xlsx(source)
+    elif source.lower().endswith(".csv"):
+        rows = _load_csv_file(source)
+    else:
+        raise RuntimeError(f"Unrecognized data source: {source[:60]}...")
+
+    _cache[source] = (now, rows)
+    return rows
+
+
+def _parse_csv(raw: str) -> list[dict]:
+    reader = csv.DictReader(io.StringIO(raw))
+    return [
+        {(k or "").strip(): ("" if v is None else str(v).strip()) for k, v in row.items()}
+        for row in reader
+    ]
+
+
+def _load_csv_url(url: str) -> list[dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": "manufacturing-mcp/1.0"})
     try:
-        dt = urllib.parse.quote(doctype)
-        nm = urllib.parse.quote(name)
-        return _request(f"/api/resource/{dt}/{nm}").get("data")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8-sig", errors="replace")
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        raise
+        raise RuntimeError(
+            f"Could not fetch sheet CSV (HTTP {e.code}). Make sure the value is "
+            "the published-to-web CSV link, not a normal edit/share link."
+        ) from e
+    return _parse_csv(raw)
 
 
-# ---------------------------------------------------------------------
-# MACHINE STATUS  ->  ERPNext "Workstation"
-# ---------------------------------------------------------------------
-def get_machine_status(machine_id: str | None = None, line_id: str | None = None):
-    filters = []
-    if machine_id:
-        filters.append(["name", "=", machine_id])
-    workstations = _frappe_list(
-        "Workstation",
-        fields=["name", "workstation_type", "status", "hour_rate"],
-        filters=filters or None,
-    )
-    # NOTE: vanilla ERPNext has no live running/idle/down state or uptime for a
-    # machine — that is MES/PLC/IoT data. "status" here is only the Workstation
-    # config status (may not exist on older sites). To show real-time state,
-    # call your MES here and merge it into each dict. `line_id` has no standard
-    # equivalent; add a custom field on Workstation and filter on it if needed.
-    return workstations
+def _load_csv_file(path: str) -> list[dict]:
+    with open(path, encoding="utf-8-sig") as f:
+        return _parse_csv(f.read())
 
 
-# ---------------------------------------------------------------------
-# WORK ORDERS  ->  ERPNext "Work Order"
-# ---------------------------------------------------------------------
-def get_work_orders(status: str | None = None, line_id: str | None = None):
-    filters = []
-    if status:
-        filters.append(["status", "=", status])
-    if line_id:
-        # ERPNext Work Orders have no built-in "production line". If you added a
-        # custom field for it, rename "line_id" below to match; otherwise remove.
-        filters.append(["line_id", "=", line_id])
-    return _frappe_list(
-        "Work Order",
-        fields=["name", "production_item", "item_name", "qty", "produced_qty",
-                "status", "planned_start_date", "expected_delivery_date",
-                "sales_order", "fg_warehouse"],
-        filters=filters or None,
-    )
-
-
-def get_work_order_by_id(order_id: str):
-    return _frappe_get("Work Order", order_id)
-
-
-# ---------------------------------------------------------------------
-# INVENTORY  ->  ERPNext "Bin" (stock levels) + "Item Reorder" (reorder levels)
-# ---------------------------------------------------------------------
-def get_inventory(sku: str | None = None, below_reorder_only: bool = False):
-    filters = []
-    if sku:
-        filters.append(["item_code", "=", sku])
-    bins = _frappe_list(
-        "Bin",
-        fields=["item_code", "warehouse", "actual_qty", "reserved_qty",
-                "projected_qty", "stock_uom"],
-        filters=filters or None,
-    )
-    if not below_reorder_only:
-        return bins
-
-    # Reorder levels live per item+warehouse on the "Item Reorder" child table.
-    reorder = _frappe_list(
-        "Item Reorder",
-        fields=["parent", "warehouse", "warehouse_reorder_level"],
-    )
-    level = {(r["parent"], r["warehouse"]): r.get("warehouse_reorder_level")
-             for r in reorder}
+def _load_xlsx(path: str) -> list[dict]:
+    from openpyxl import load_workbook   # only needed for local .xlsx
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    it = ws.iter_rows(values_only=True)
+    headers = [str(h).strip() if h is not None else "" for h in next(it)]
     out = []
-    for b in bins:
-        lvl = level.get((b["item_code"], b["warehouse"]))
-        if lvl is not None and (b.get("actual_qty") or 0) < lvl:
-            b["reorder_level"] = lvl
-            out.append(b)
+    for r in it:
+        if all(c is None for c in r):
+            continue
+        out.append({
+            headers[i]: ("" if i >= len(r) or r[i] is None else str(r[i]).strip())
+            for i in range(len(headers))
+        })
     return out
 
 
 # ---------------------------------------------------------------------
-# QUALITY LOGS  ->  ERPNext "Quality Inspection"
+# GENERIC QUERY API  (called by server.py — works on ANY sheet)
 # ---------------------------------------------------------------------
-def get_quality_logs(product_id: str | None = None, min_defect_rate_pct: float | None = None):
-    filters = []
-    if product_id:
-        filters.append(["item_code", "like", f"%{product_id}%"])
-    logs = _frappe_list(
-        "Quality Inspection",
-        fields=["name", "item_code", "item_name", "report_date", "status",
-                "sample_size", "inspected_by", "remarks",
-                "reference_type", "reference_name"],
-        filters=filters or None,
-    )
-    # NOTE: vanilla ERPNext Quality Inspection is pass/fail (status), not a
-    # defect-rate %. `min_defect_rate_pct` has no native equivalent, so it is
-    # ignored unless you added a custom defect-rate field (then filter on it).
-    return logs
+def _cell(row: dict, col: str):
+    if col in row:
+        return row[col]
+    low = {k.lower(): v for k, v in row.items()}
+    return low.get(str(col).lower())
 
 
-# ---------------------------------------------------------------------
-# DISPATCH  ->  ERPNext "Delivery Note"
-# ---------------------------------------------------------------------
-def get_dispatches(status: str | None = None, order_id: str | None = None):
-    filters = [["docstatus", "=", 1]]   # submitted delivery notes only
-    if status:
-        filters.append(["status", "=", status])
-    dns = _frappe_list(
-        "Delivery Note",
-        fields=["name", "customer", "posting_date", "status",
-                "transporter", "vehicle_no", "lr_no"],
-        filters=filters,
-    )
-    if order_id:
-        # DN -> Sales Order link lives on the child table "Delivery Note Item".
-        links = _frappe_list(
-            "Delivery Note Item",
-            fields=["parent", "against_sales_order"],
-            filters=[["against_sales_order", "=", order_id]],
-        )
-        parents = {l["parent"] for l in links}
-        dns = [d for d in dns if d["name"] in parents]
-    return dns
-
-
-def get_on_time_dispatch_rate():
-    # Promised date = Sales Order.delivery_date; actual = Delivery Note.posting_date.
-    # On-time if actual <= promised. (ERPNext doesn't store this as one field, so
-    # we compute it. For large volumes, consider a server-side Frappe report.)
-    dns = _frappe_list(
-        "Delivery Note",
-        fields=["name", "posting_date"],
-        filters=[["docstatus", "=", 1]],
-    )
-    if not dns:
-        return {"on_time_pct": None, "total_completed": 0}
-
-    links = _frappe_list(
-        "Delivery Note Item",
-        fields=["parent", "against_sales_order"],
-        filters=[["against_sales_order", "!=", ""]],
-    )
-    dn_to_so = {}
-    so_names = set()
-    for row in links:
-        so = row.get("against_sales_order")
-        if so:
-            dn_to_so.setdefault(row["parent"], so)   # first SO per DN
-            so_names.add(so)
-
-    so_delivery = {}
-    so_list = list(so_names)
-    for i in range(0, len(so_list), 100):
-        chunk = so_list[i:i + 100]
-        for so in _frappe_list(
-            "Sales Order",
-            fields=["name", "delivery_date"],
-            filters=[["name", "in", chunk]],
-        ):
-            so_delivery[so["name"]] = so.get("delivery_date")
-
-    on_time = late = unknown = 0
-    for dn in dns:
-        promised = so_delivery.get(dn_to_so.get(dn["name"]))
-        actual = dn.get("posting_date")
-        if not promised or not actual:
-            unknown += 1
-        elif actual <= promised:
-            on_time += 1
-        else:
-            late += 1
-
-    completed = on_time + late
-    return {
-        "on_time_pct": round(on_time / completed * 100, 1) if completed else None,
-        "total_completed": completed,
-        "on_time_count": on_time,
-        "late_count": late,
-        "unknown_count": unknown,
-    }
-
-
-# ---------------------------------------------------------------------
-# VEHICLE TRACKING  ->  ERPNext "Vehicle" (fleet master) + Delivery Note
-# ---------------------------------------------------------------------
-def get_vehicle_status(vehicle_id: str | None = None):
-    filters = []
-    if vehicle_id:
-        filters.append(["name", "=", vehicle_id])
-    vehicles = _frappe_list(
-        "Vehicle",
-        fields=["name", "license_plate", "make", "model",
-                "last_odometer", "fuel_type"],
-        filters=filters or None,
-    )
-    # NOTE: ERPNext's Vehicle DocType is a fleet MASTER record. Live location /
-    # ETA is NOT in ERPNext — it comes from a GPS/telematics provider. If you
-    # have one, call its API here and merge location/ETA into each dict.
-    return vehicles
-
-
-def get_vehicle_by_dispatch(dispatch_id: str):
-    dn = _frappe_get("Delivery Note", dispatch_id)
-    if not dn:
-        return None
-    return {
-        "dispatch_id": dispatch_id,
-        "vehicle_no": dn.get("vehicle_no"),
-        "transporter": dn.get("transporter"),
-        "lr_no": dn.get("lr_no"),
-        "customer": dn.get("customer"),
-        # Live location/ETA would come from your GPS provider keyed on vehicle_no.
-    }
-
-
-# =====================================================================
-# REAL PRODUCTION / SALES ORDERS  ->  ERPNext "Sales Order"
-# ---------------------------------------------------------------------
-# The spreadsheet/CSV source is gone. This now reads live from your
-# Frappe/ERPNext site's Sales Order doctype via the same _frappe_list /
-# _frappe_get helpers used everywhere else in this file.
-#
-# Field names below (customer, transaction_date, delivery_date, total_qty,
-# per_delivered, grand_total, status) are STANDARD ERPNext Sales Order
-# fields. If your site customised Sales Order, fetch one record to check:
-#   curl -H "Authorization: token KEY:SECRET" \
-#        "$FRAPPE_URL/api/resource/Sales Order/SO-2026-00001"
-#
-# NOTE: "Priority" has no standard equivalent on Sales Order. If you added
-# a custom field for it, add its fieldname to `_SO_FIELDS` and filter on
-# it in get_orders(); until then the `priority` argument is accepted but
-# ignored (matches everything, never errors).
-# =====================================================================
-import datetime
-import calendar
-
-_SO_FIELDS = [
-    "name", "customer", "status", "transaction_date", "delivery_date",
-    "grand_total", "total_qty", "per_delivered", "per_billed",
-]
-
-
-def _month_str(date_str):
-    """'2026-07-15' -> 'July-2026' (matches the old Month column format)."""
-    if not date_str:
-        return None
-    try:
-        y, m, _d = str(date_str).split("-")
-        return f"{calendar.month_name[int(m)]}-{y}"
-    except (ValueError, IndexError):
-        return None
-
-
-def _map_sales_order(r: dict) -> dict:
-    total_qty = r.get("total_qty") or 0
-    per_delivered = r.get("per_delivered") or 0
-    qty_dispatched = round(total_qty * per_delivered / 100, 2) if total_qty else 0
-
-    pending_days = None
-    delivery_date = r.get("delivery_date")
-    if delivery_date and r.get("status") not in ("Completed", "Closed", "Cancelled"):
+def list_sheets() -> list[dict]:
+    """Every connected sheet, with its columns and row count."""
+    out = []
+    for name in list_sheet_names():
         try:
-            dd = datetime.date.fromisoformat(str(delivery_date))
-            pending_days = (dd - datetime.date.today()).days
-        except ValueError:
-            pass
+            rows = _load(_resolve(name))
+            out.append({
+                "sheet": name,
+                "row_count": len(rows),
+                "columns": list(rows[0].keys()) if rows else [],
+            })
+        except Exception as e:   # noqa: BLE001 - report per-sheet, don't crash the list
+            out.append({"sheet": name, "error": str(e)})
+    return out
 
+
+def describe_sheet(sheet: str) -> dict:
+    """Columns, row count, and a few sample rows for one sheet."""
+    rows = _load(_resolve(sheet))
     return {
-        "Order_ID": r.get("name"),
-        "Client": r.get("customer"),
-        "Row_Status": r.get("status"),
-        "Order_Date": r.get("transaction_date"),
-        "Delivery_Date": delivery_date,
-        "Month": _month_str(r.get("transaction_date")),
-        "Amount": r.get("grand_total"),
-        "Qty_Ordered": total_qty,
-        "Qty_Dispatched": qty_dispatched,
-        "Pending_Days": pending_days,
+        "sheet": sheet,
+        "columns": list(rows[0].keys()) if rows else [],
+        "row_count": len(rows),
+        "sample_rows": rows[:3],
     }
 
 
-def get_orders(order_id=None, client=None, status=None, priority=None, month=None):
-    filters = []
-    if order_id:
-        filters.append(["name", "=", order_id])
-    if client:
-        filters.append(["customer", "like", f"%{client}%"])
-    if status:
-        filters.append(["status", "=", status])
-    # month filtering happens after fetch, since Frappe filters can't do
-    # "contains substring of formatted month name" directly.
-
-    rows = _frappe_list("Sales Order", fields=_SO_FIELDS, filters=filters or None,
-                         order_by="transaction_date desc")
-    orders = [_map_sales_order(r) for r in rows]
-
-    if month:
-        orders = [o for o in orders if o.get("Month") and month.lower() in o["Month"].lower()]
-    # priority: no native field yet — see note above.
-
-    return orders
-
-
-def get_order_by_id(order_id: str):
-    r = _frappe_get("Sales Order", order_id)
-    return _map_sales_order(r) if r else None
+def get_sheet_rows(sheet: str, filters: dict | None = None, limit: int | None = None) -> list[dict]:
+    """
+    Rows from `sheet`. `filters` is {column: value}; a row matches when each
+    column's cell CONTAINS the given value (case-insensitive). `limit` caps
+    how many rows return.
+    """
+    rows = _load(_resolve(sheet))
+    if filters:
+        def match(r):
+            for col, val in filters.items():
+                if val in (None, ""):
+                    continue
+                if str(val).lower() not in str(_cell(r, col) or "").lower():
+                    return False
+            return True
+        rows = [r for r in rows if match(r)]
+    if limit and limit > 0:
+        rows = rows[:limit]
+    return rows
 
 
-def get_order_summary():
-    orders = get_orders()
-    total = len(orders)
-    by_status: dict[str, int] = {}
-    for o in orders:
-        s = o.get("Row_Status") or "Unknown"
-        by_status[s] = by_status.get(s, 0) + 1
+def search_sheet(sheet: str, query: str, limit: int | None = None) -> list[dict]:
+    """Rows from `sheet` where ANY cell contains `query` (case-insensitive)."""
+    q = str(query).lower()
+    rows = [r for r in _load(_resolve(sheet)) if any(q in str(v or "").lower() for v in r.values())]
+    if limit and limit > 0:
+        rows = rows[:limit]
+    return rows
 
-    def _avg(field):
-        vals = [o[field] for o in orders
-                if isinstance(o.get(field), (int, float)) and 0 <= o[field] <= 3650]
-        return round(sum(vals) / len(vals), 1) if vals else None
 
-    total_qty_ordered = sum(o["Qty_Ordered"] for o in orders if isinstance(o.get("Qty_Ordered"), (int, float)))
-    total_qty_dispatched = sum(o["Qty_Dispatched"] for o in orders if isinstance(o.get("Qty_Dispatched"), (int, float)))
-
-    return {
-        "total_orders": total,
-        "orders_by_status": by_status,
-        "total_qty_ordered": total_qty_ordered,
-        "total_qty_dispatched": total_qty_dispatched,
-        "avg_pending_days": _avg("Pending_Days"),
-        "avg_turnaround_days": None,  # no equivalent on Sales Order; add a custom field if you need it
-    }
+# ---------------------------------------------------------------------
+# Quick self-test:  python3 data_access.py
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    names = list_sheet_names()
+    print(f"Discovered {len(names)} sheet(s): {names}")
+    for s in list_sheets():
+        print(" -", s)
