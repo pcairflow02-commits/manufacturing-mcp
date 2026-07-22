@@ -23,6 +23,20 @@ The spreadsheet must be readable by the key: set Share -> General access ->
 "Anyone with the link" -> Viewer.
 
 ------------------------------------------------------------------------------
+MERGED CELLS
+------------------------------------------------------------------------------
+The plain `/values/` endpoint returns a merged cell's text ONLY in the merge's
+top-left ("anchor") cell; every other cell the merge covers comes back blank.
+For manufacturing sheets that merge a Client / Job / PO across the several
+component rows beneath it, that means those rows lose their key values — so
+filtering, searching and counting are wrong, and continuation rows can even be
+dropped as "blank".
+
+To fix this we read the tab with `includeGridData=true`, which also returns the
+sheet's `merges` metadata, and we PROPAGATE each merge's anchor value across
+every cell in its range BEFORE building rows. See `_api_values`.
+
+------------------------------------------------------------------------------
 FALLBACK
 ------------------------------------------------------------------------------
 If GOOGLE_API_KEY / SPREADSHEET_IDS are not set, this falls back to the older
@@ -65,19 +79,94 @@ def _api_meta(spreadsheet_id: str) -> dict:
     return _api_get(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?key={GOOGLE_API_KEY}")
 
 
+def _dedup_headers(raw: list) -> list[str]:
+    """Turn a raw header row into unique, non-empty column names.
+
+    Blank cells become col1/col2/... (by position, matching the old behavior);
+    duplicates — e.g. a horizontally merged group header propagated across the
+    columns it spans — get a ' (2)', ' (3)' suffix so they don't collapse into
+    a single dict key and silently drop columns.
+    """
+    headers: list[str] = []
+    counts: dict[str, int] = {}
+    for i, h in enumerate(raw):
+        name = (str(h).strip() if h is not None else "") or f"col{i + 1}"
+        if name in counts:
+            counts[name] += 1
+            name = f"{name} ({counts[name]})"
+        else:
+            counts[name] = 1
+        headers.append(name)
+    return headers
+
+
 def _api_values(spreadsheet_id: str, tab: str) -> list[dict]:
+    """Read a tab as row dicts, correctly expanding merged cells.
+
+    Uses includeGridData=true so we get BOTH the grid values and the tab's
+    `merges` metadata in a single call, then copies every merge's anchor value
+    into all the cells it covers before the header row and the data rows are
+    built. This is what makes vertically-merged Client/Job/PO columns show up
+    on every row instead of only the first.
+    """
     sid = urllib.parse.quote(spreadsheet_id)
     # Quote the tab title so titles with spaces/symbols work as a range.
     rng = urllib.parse.quote(f"'{tab.replace(chr(39), chr(39) * 2)}'")
-    url = (f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{rng}"
-           f"?majorDimension=ROWS&key={GOOGLE_API_KEY}")
-    values = _api_get(url).get("values", [])
-    if not values:
+    fields = urllib.parse.quote(
+        "sheets(merges,data(startRow,startColumn,rowData.values.formattedValue))"
+    )
+    url = (f"https://sheets.googleapis.com/v4/spreadsheets/{sid}"
+           f"?ranges={rng}&includeGridData=true&fields={fields}"
+           f"&key={GOOGLE_API_KEY}")
+    resp = _api_get(url)
+
+    sheets = resp.get("sheets") or []
+    if not sheets:
         return []
-    headers = [str(h).strip() or f"col{i+1}" for i, h in enumerate(values[0])]
+    sheet0 = sheets[0]
+    data = sheet0.get("data") or []
+    if not data:
+        return []
+    block = data[0]
+    row_off = block.get("startRow", 0) or 0        # 0 when reading the whole tab
+    col_off = block.get("startColumn", 0) or 0
+
+    # Build a rectangular grid of displayed strings (None for empty cells).
+    grid: list[list] = []
+    for rd in (block.get("rowData") or []):
+        cells = rd.get("values") or []
+        grid.append([(c.get("formattedValue") if c else None) for c in cells])
+    if not grid:
+        return []
+
+    width = max((len(r) for r in grid), default=0)
+    if width == 0:
+        return []
+    for r in grid:
+        if len(r) < width:
+            r.extend([None] * (width - len(r)))
+
+    # --- KEY FIX: propagate every merged cell's anchor value across its range.
+    for m in (sheet0.get("merges") or []):
+        r0 = m.get("startRowIndex", 0) - row_off
+        r1 = m.get("endRowIndex", 0) - row_off          # exclusive
+        c0 = m.get("startColumnIndex", 0) - col_off
+        c1 = m.get("endColumnIndex", 0) - col_off        # exclusive
+        if r0 < 0 or c0 < 0 or r0 >= len(grid) or c0 >= width:
+            continue
+        anchor = grid[r0][c0]
+        if anchor in (None, ""):
+            continue
+        for rr in range(r0, min(r1, len(grid))):
+            row = grid[rr]
+            for cc in range(c0, min(c1, width)):
+                if row[cc] in (None, ""):
+                    row[cc] = anchor
+
+    headers = _dedup_headers(grid[0])
     out = []
-    for r in values[1:]:
-        if not any(str(c).strip() for c in r):
+    for r in grid[1:]:
+        if not any((str(c).strip() if c is not None else "") for c in r):
             continue
         out.append({
             headers[i]: (str(r[i]).strip() if i < len(r) and r[i] is not None else "")
@@ -202,13 +291,33 @@ def _load_csv_file(path: str) -> list[dict]:
 
 def _load_xlsx(path: str) -> list[dict]:
     from openpyxl import load_workbook
-    wb = load_workbook(path, read_only=True, data_only=True)
+    from openpyxl.utils import range_boundaries
+    wb = load_workbook(path, read_only=False, data_only=True)
     ws = wb.active
-    it = ws.iter_rows(values_only=True)
-    headers = [str(h).strip() if h is not None else "" for h in next(it)]
+
+    # Read the whole grid so we can expand merges the same way as the API path.
+    grid = [list(row) for row in ws.iter_rows(values_only=True)]
+    if not grid:
+        return []
+    width = max((len(r) for r in grid), default=0)
+    for r in grid:
+        if len(r) < width:
+            r.extend([None] * (width - len(r)))
+
+    for rng in list(ws.merged_cells.ranges):
+        c0, r0, c1, r1 = range_boundaries(str(rng))   # 1-based, inclusive
+        anchor = grid[r0 - 1][c0 - 1]
+        if anchor in (None, ""):
+            continue
+        for rr in range(r0 - 1, r1):
+            for cc in range(c0 - 1, c1):
+                if grid[rr][cc] in (None, ""):
+                    grid[rr][cc] = anchor
+
+    headers = _dedup_headers([("" if h is None else str(h).strip()) for h in grid[0]])
     out = []
-    for r in it:
-        if all(c is None for c in r):
+    for r in grid[1:]:
+        if all(c is None or str(c).strip() == "" for c in r):
             continue
         out.append({
             headers[i]: ("" if i >= len(r) or r[i] is None else str(r[i]).strip())
